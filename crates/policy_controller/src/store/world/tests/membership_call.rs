@@ -64,8 +64,8 @@ mod held {
         lease::{Lifecycle, Membership},
         spec::{BindingSpec, Needs},
         store::{
-            world::ViewBuffers, Kinds, MembershipChange, MemoryStore, WorkerFacts, WorkerPatch,
-            WorkerStatus, WorkersStore,
+            world::ViewBuffers, Kinds, MembershipChange, MemoryStore, Position, WorkerFacts,
+            WorkerPatch, WorkerStatus, WorkersStore,
         },
         view::{Candidate, Constraints, Identity, RequestFacts, Role, WorkerId},
         AppliedSpec, Catalog, ConsistentHash, PolicySpec, Scratch,
@@ -358,7 +358,13 @@ mod held {
         // A followed registration is told as the leader's own is.
         let joined = member(&leader, "http://c:8000");
         let row = WorkersStore::get(&leader, joined).expect("the row");
-        standby.follow(3, MembershipChange::Registered { id: joined }, Some(row));
+        let unjournaled = Position::default();
+        standby.follow(
+            unjournaled,
+            3,
+            MembershipChange::Registered { id: joined },
+            Some(row),
+        );
         let added = format!("{:?}", Membership::Added(joined));
         assert_eq!(told.lock().last(), Some(&(3, added)));
     }

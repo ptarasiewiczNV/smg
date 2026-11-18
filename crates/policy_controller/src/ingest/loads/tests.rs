@@ -22,8 +22,9 @@ use super::{
 use crate::{
     spec::{BindingSpec, OverloadSpec},
     store::{
-        Ask, GatewayId, Kinds, LoadSink, LoadSource, MembershipChange, MemoryStore, Reachability,
-        Signals, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        Ask, GatewayId, Kinds, LoadSink, LoadSource, MembershipChange, MemoryStore, Position,
+        Reachability, Signals, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+        PUBLISH_WINDOW,
     },
     view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
     AppliedSpec, PolicySpec,
@@ -1837,8 +1838,14 @@ async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
         from: told.status,
         to: WorkerStatus::Ready,
     };
-    store.follow(1, MembershipChange::Registered { id }, Some(told));
-    store.follow(2, ready, None);
+    let unjournaled = Position::default();
+    store.follow(
+        unjournaled,
+        1,
+        MembershipChange::Registered { id },
+        Some(told),
+    );
+    store.follow(unjournaled, 2, ready, None);
     assert_eq!(seen(id), Some(None), "a followed registration");
     // Two followed load rows, the leader's polls: the first opens the store's
     // window and shows by itself, the second lands inside it and waits for
