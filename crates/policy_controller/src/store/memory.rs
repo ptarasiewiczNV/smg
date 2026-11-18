@@ -263,6 +263,15 @@ impl MemoryStore {
     /// ([`Membership::Snapshot`]), and the journal's listener once the
     /// restore's locks are let go. `false`, with nothing changed, where the
     /// journal refuses the place ([`Journal::restart`]).
+    ///
+    /// A replica that restores holds no lease. What stands on file was
+    /// filed while this replica led and is another history's by now: its
+    /// end was told to another leader, and no frame of the stream ends it
+    /// here. Behind the restore's locks each lease leaves the file on the
+    /// count it booked, and the standing generation's engine is told the
+    /// ones it issued, once each, as a removed worker's leases are told
+    /// ([`ReleaseReason::WorkerRemoved`]). A gateway's `Hello` files what
+    /// it lists again once this replica leads ([`LeasesStore::restore`]).
     pub fn restore_from(&self, cut: Cut) -> bool {
         // Taken before the first lock, so dropped after the last: the journal
         // restarts inside the locks, and its listener is told behind them.
@@ -328,8 +337,22 @@ impl MemoryStore {
         // id, as an apply tells a generation's.
         self.tell_members(&workers);
         drop(workers);
-        let mut leases = self.leases.lock();
-        leases.term = leases.term.max(cut.at.term);
+        let ended = {
+            let mut leases = self.leases.lock();
+            leases.term = leases.term.max(cut.at.term);
+            leases.empty()
+        };
+        // The leases' lock nests with no other, so it is let go before the
+        // engine is told. The engine at hand is told of the leases its own
+        // generation issued: a later generation's stages never saw the
+        // issue.
+        let world = self.world.load();
+        let (engine, generation) = (world.spec().engine(), world.spec().generation());
+        for record in &ended {
+            if record.lease.generation == generation {
+                engine.on_released(&record.lease, ReleaseReason::WorkerRemoved);
+            }
+        }
         true
     }
 
@@ -2064,6 +2087,15 @@ impl Leases {
             self.counts.free(booked);
         }
         Some(held.record)
+    }
+
+    /// Takes every lease off the file, each by the file's one end, and
+    /// every place of the deadline queue with them: what a restore
+    /// leaves of the leases this replica filed.
+    fn empty(&mut self) -> Vec<LeaseRecord> {
+        let keys: Vec<Key> = self.records.keys().copied().collect();
+        self.due.clear();
+        keys.iter().filter_map(|key| self.end(key)).collect()
     }
 
     /// Queues `deadline` in its order. The deadlines come in rising order

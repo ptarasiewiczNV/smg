@@ -61,11 +61,11 @@ mod held {
     };
     use crate::{
         framework::{Scorer, TieBand},
-        lease::{Lifecycle, Membership},
+        lease::{Lease, Lifecycle, Membership, ReleaseReason},
         spec::{BindingSpec, Needs},
         store::{
-            world::ViewBuffers, Kinds, MembershipChange, MemoryStore, Position, WorkerFacts,
-            WorkerPatch, WorkerStatus, WorkersStore,
+            tests::lease, world::ViewBuffers, GatewayId, Kinds, LeasesStore, MembershipChange,
+            MemoryStore, Position, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
         },
         view::{Candidate, Constraints, Identity, RequestFacts, Role, WorkerId},
         AppliedSpec, Catalog, ConsistentHash, PolicySpec, Scratch,
@@ -101,6 +101,17 @@ mod held {
             let shown = store.map_or(0, |store| store.world().epoch());
             self.told.lock().push((shown, format!("{change:?}")));
             self.ring.on_membership(change);
+        }
+
+        fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+            let store = self.store.upgrade();
+            if let Some(store) = &store {
+                // A release the store tells comes with its locks let go.
+                assert!(store.workers_lock_free(), "told under the membership lock");
+            }
+            let shown = store.map_or(0, |store| store.world().epoch());
+            let call = format!("released {} {reason:?}", lease.id.0);
+            self.told.lock().push((shown, call));
         }
 
         fn needs_lifecycle(&self) -> bool {
@@ -367,5 +378,43 @@ mod held {
         );
         let added = format!("{:?}", Membership::Added(joined));
         assert_eq!(told.lock().last(), Some(&(3, added)));
+    }
+
+    /// A restore ends every lease the replica filed, and the standing
+    /// generation's engine is told each of its own once, after the
+    /// members, as a removed worker's leases are told. A lease another
+    /// generation issued is told to no stage: none of these saw its
+    /// issue.
+    #[test]
+    fn a_restore_tells_the_engine_each_lease_it_ended_once() {
+        let leader = MemoryStore::new();
+        let members = [member(&leader, "http://a:8000")];
+        let standby = Arc::new(MemoryStore::new());
+        let (ring, told) = (Arc::new(ConsistentHash::new(None)), Told::default());
+        standby
+            .apply(generation(1, &standby, &ring, &told))
+            .expect("applied");
+        let own = member(&standby, "http://own:8000");
+        standby.set_term(1);
+        let now = Instant::now();
+        for (id, generation) in [(1, 1), (2, 1), (3, 2)] {
+            let mut record = lease(GatewayId(1), id, 1, now);
+            record.lease.generation = generation;
+            record.target = own;
+            LeasesStore::issue(&*standby, record).expect("filed");
+        }
+        told.lock().clear();
+        assert!(standby.restore_from(leader.cut(Kinds::All)));
+        let mut calls: Vec<String> = told.lock().drain(..).map(|(_, call)| call).collect();
+        let snapshot = format!("{:?}", Membership::Snapshot(&members));
+        assert_eq!(calls.remove(0), snapshot);
+        calls.sort_unstable();
+        assert_eq!(
+            calls,
+            ["released 1 WorkerRemoved", "released 2 WorkerRemoved"]
+        );
+        // The file is empty: a second restore ends no lease.
+        assert!(standby.restore_from(leader.cut(Kinds::All)));
+        assert_eq!(told.lock().len(), 1, "a lease was told twice");
     }
 }

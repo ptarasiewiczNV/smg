@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use super::{
     identity, identity_of,
     leases::{Counts, Slot},
-    Ask, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, HealthSink, KvEvent,
+    Ask, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, HealthSink, Kinds, KvEvent,
     KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
     MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode, Reachability,
     ReservationKind, ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals,
@@ -55,7 +55,9 @@ fn batch(sequence: u64) -> BatchFacts {
     }
 }
 
-fn lease(gateway: GatewayId, id: u64, term: u64, now: Instant) -> LeaseRecord {
+/// A lease of `gateway` on worker 7, issued at `now` under `term`: the one
+/// place the store's cases build a record's fields, the world's among them.
+pub(super) fn lease(gateway: GatewayId, id: u64, term: u64, now: Instant) -> LeaseRecord {
     LeaseRecord {
         lease: Lease {
             id: LeaseId(id),
@@ -1566,6 +1568,49 @@ fn a_views_row_reads_the_leases_on_file_that_book_its_worker() {
     let mut left = [(a, 2), (c, 0)];
     left.sort_unstable();
     assert_eq!(in_flight(&store), left);
+}
+
+/// A replica that restores holds no lease. What it filed in an earlier
+/// lead is another history's: the file is empty behind the restore, its
+/// deadline queue with it, and every count reads zero. When the replica
+/// leads again the gateway's `Hello` files what it lists, and each count
+/// reads that list once.
+#[test]
+fn a_restore_empties_the_lease_file_and_a_hello_books_what_it_lists_once() {
+    let store = MemoryStore::new();
+    let (a, b) = (ready(&store, "http://a:1"), ready(&store, "http://b:1"));
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    store.set_term(1);
+    for (id, target) in [(1, a), (2, a), (3, b)] {
+        LeasesStore::issue(&store, booking(gateway, id, target, now)).expect("filed");
+    }
+    let of = |a_holds, b_holds| {
+        let mut rows = [(a, a_holds), (b, b_holds)];
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(in_flight(&store), of(2, 1));
+    assert_eq!(store.queued(), 3);
+    // Another replica led over the same rows, and this one restores from
+    // its cut.
+    let leader = MemoryStore::new();
+    let theirs = (ready(&leader, "http://a:1"), ready(&leader, "http://b:1"));
+    assert_eq!(theirs, (a, b));
+    assert!(store.restore_from(leader.cut(Kinds::All)));
+    let leases: &dyn LeasesStore = &store;
+    assert_eq!(leases.live(gateway), 0, "a lease stood behind the restore");
+    assert!(leases.get(gateway, LeaseId(1)).is_none());
+    assert_eq!(store.queued(), 0);
+    assert_eq!(in_flight(&store), of(0, 0));
+    // The lead taken again: the gateway lists the two leases it still
+    // holds, one a worker.
+    store.set_term(3);
+    let listed = [booking(gateway, 1, a, now), booking(gateway, 3, b, now)];
+    assert_eq!(leases.restore(gateway, &listed), 2);
+    assert_eq!(in_flight(&store), of(1, 1));
+    // An end the gateway reports then gives its count back.
+    assert!(leases.released(gateway, LeaseId(1), None, ReleaseReason::ClientGone));
+    assert_eq!(in_flight(&store), of(0, 1));
 }
 
 /// A pool that holds another gateway's host-local row is walked as its
