@@ -51,7 +51,7 @@
 use std::{mem, ops::Deref, time::Duration};
 
 use crate::{
-    decision::{Decision, Lifted, ShedReason, Target, Trace},
+    decision::{Decision, ShedReason, Target, Trace},
     lease::Lease,
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     spec::{AppliedSpec, MAX_HEADERS},
@@ -548,16 +548,8 @@ fn trace(trace: &Trace) -> proto::Trace {
             .collect(),
         seed: trace.seed,
         generation: trace.generation,
-        lifted: lifted(trace.lifted) as i32,
+        lifted: proto::LiftedVeto::from(trace.lifted) as i32,
         ..proto::Trace::default()
-    }
-}
-
-/// The contract's word for the veto the all-vetoed rule lifted.
-const fn lifted(mark: Lifted) -> proto::LiftedVeto {
-    match mark {
-        Lifted::None => proto::LiftedVeto::None,
-        Lifted::Overload => proto::LiftedVeto::Overload,
     }
 }
 
