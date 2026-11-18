@@ -30,7 +30,8 @@
 //! list joins at its first decision, with every other row of that view, and
 //! a changed listing splits [`SPAN`] evenly among all of it until the next
 //! cut. The lifecycle prunes: a removed worker's range goes to the range
-//! below it, and a replaced handle keeps its predecessor's place. A handle
+//! below it, and a replaced handle keeps its predecessor's place. A worker
+//! a registration took off a model leaves that model's listing alone. A handle
 //! a view listed before the word of its replacement keeps its own place,
 //! and its predecessor's leaves as a removed worker's does. All of it is
 //! soft state, which a new process learns again within one window, and so
@@ -569,6 +570,15 @@ impl Lifecycle for Bucket {
                 Membership::Replaced { old, new } => pool.rename(old, new),
                 Membership::Snapshot(ids) => {
                     pool.retain(ids);
+                    false
+                }
+                // A worker a registration took off this partition's model
+                // leaves its listing. The partitions of the models it still
+                // serves keep its place, its range and its load.
+                Membership::Left { id, models } => {
+                    if models.iter().any(|left| **left == **model) {
+                        pool.remove(id);
+                    }
                     false
                 }
                 // A worker joins from a view of its pool: the feed names an
@@ -1197,6 +1207,70 @@ mod tests {
         // The model's next decision lists again from an even split.
         assert_eq!(led(&scorer, &pool, 3_000, 16 * SECOND), Some(2));
         assert_eq!(loads(&scorer), (vec![0, 0, 0], 0));
+    }
+
+    /// A worker a registration took off a model leaves that model's
+    /// listing and keeps its place, its range and its load under the model
+    /// it still serves, where its next booking alone lands. The words of a
+    /// row's facts unlist nobody, and a model whose last worker left this
+    /// way takes its partition with it.
+    #[test]
+    fn a_worker_a_registration_took_off_a_model_leaves_that_model_s_listing_alone() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let (pool_a, pool_b) = (pool(2), pool(4));
+        for (model, pool) in [("a", &pool_a), ("b", &pool_b)] {
+            led_by(&scorer, &prefill(model, 3_000, SECOND), pool, &all(pool));
+        }
+        let moved = pool_a[1].id;
+        book(&scorer, &pool_a, 1, 30, SECOND);
+        // Each member with its load, each range, and the window's total.
+        let listing = |model: &str| {
+            let partition = of(&scorer, model);
+            let held = partition.lock();
+            let members: Vec<(WorkerId, u64)> = held
+                .members
+                .iter()
+                .map(|member| (member.id, member.load))
+                .collect();
+            let ranges: Vec<(u32, u32, u32)> = held
+                .ranges
+                .iter()
+                .map(|range| (range.member, range.lower, range.upper))
+                .collect();
+            (members, ranges, held.total)
+        };
+        let (a, b) = (listing("a"), listing("b"));
+        assert_eq!(a.0, [(pool_a[0].id, 0), (moved, 30)]);
+        // A row's facts changed: nobody is unlisted.
+        for word in [
+            Membership::Added(moved),
+            Membership::Relabelled(moved),
+            Membership::Resized(moved),
+        ] {
+            scorer.on_membership(&word);
+        }
+        assert_eq!((listing("a"), listing("b")), (a, b.clone()));
+        // Off model a, and off a model no decision listed.
+        scorer.on_membership(&Membership::Left {
+            id: moved,
+            models: &["a".into(), "c".into()],
+        });
+        assert_eq!(listing("a").0, [(pool_a[0].id, 0)]);
+        assert_eq!(listing("b"), b, "the model it still serves moved");
+        // Its next booking lands under the model it serves, and there alone.
+        book(&scorer, &pool_b, 1, 5, SECOND);
+        assert_eq!(listing("a").2, 30, "booked under the model it left");
+        assert_eq!(listing("b").0[1], (moved, 35));
+        // The model's last worker leaves the same way, and the partition
+        // with it.
+        let held = of(&scorer, "a");
+        scorer.on_membership(&Membership::Left {
+            id: pool_a[0].id,
+            models: &["a".into()],
+        });
+        assert!(scorer.partitions.load().get("a").is_none());
+        assert!(held.lock().left, "a decision that holds it takes the next");
+        assert_eq!(listing("b").0.len(), 4);
     }
 
     #[test]

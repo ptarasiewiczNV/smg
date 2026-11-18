@@ -7,6 +7,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    mem,
     ops::{Deref, DerefMut},
     sync::Arc,
     time::{Duration, Instant},
@@ -33,8 +34,8 @@ use crate::{
             WorkerStatus, WorkersStore,
         },
         world::{
-            micros, same_offer, Ask, Built, Classes, EncodePairBuffers, OutsideLists, PairBuffers,
-            StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW,
+            left_models, micros, same_offer, Ask, Built, Classes, EncodePairBuffers, OutsideLists,
+            PairBuffers, StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW,
         },
         GatewayId,
     },
@@ -352,8 +353,10 @@ impl MemoryStore {
     /// caller starts again from a snapshot.
     ///
     /// The world's engine is told the change as at the leader's own write
-    /// ([`MembershipChange::as_lifecycle`]): a standby's stages hold what
-    /// its leader's hold, with no step at a take.
+    /// ([`MembershipChange::as_lifecycle`]), and ahead of it the models a
+    /// registration took its worker off ([`Membership::Left`]): a
+    /// standby's stages hold what its leader's hold, with no step at a
+    /// take.
     pub fn follow(&self, epoch: u64, change: MembershipChange, row: Option<WorkerRow>) {
         let mut workers = self.writing();
         if epoch != workers.epoch + 1 {
@@ -362,6 +365,9 @@ impl MemoryStore {
         // A row told again with the offer it had moves no pair class, here
         // as in the leader's own write: the classes are carried.
         let mut classes = Classes::Derive;
+        // The models a registration that stays under its id takes its
+        // worker off, for the stages: here as in the leader's own write.
+        let mut off = Vec::new();
         let (change, left) = match (change, row) {
             (MembershipChange::Registered { id }, Some(row))
                 if row.id == id
@@ -386,7 +392,8 @@ impl MemoryStore {
                     classes = Classes::Carry;
                 }
                 row.admitted_at = held.row.admitted_at;
-                held.row = row;
+                let old = mem::replace(&mut held.row, row);
+                off = left_models(old.facts, &held.row.facts);
                 if resized {
                     (MembershipChange::Resized { id }, None)
                 } else {
@@ -439,7 +446,7 @@ impl MemoryStore {
             }
             MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
                 self.index_member(&workers, id);
-                self.rebuild_world(&workers, classes, change);
+                self.rebuild_leaving(&workers, classes, change, &off);
             }
             MembershipChange::StatusChanged { id, to, .. } => self.show_status(id, to),
             MembershipChange::Removed { .. } => {
@@ -617,9 +624,27 @@ impl MemoryStore {
     /// own state, as the ring fences a pruned id ([`crate::ring::FENCE`]).
     fn rebuild_world(&self, workers: &Workers, classes: Classes, change: MembershipChange) {
         self.swap_world(workers, classes);
-        if let Some(change) = change.as_lifecycle() {
-            self.world.load().spec().engine().on_membership(&change);
+        self.tell_of(change);
+    }
+
+    /// [`MemoryStore::rebuild_world`] for a registration that stays under
+    /// its id and takes its worker off `left`, the models of
+    /// [`left_models`]: the engine hears [`Membership::Left`] between the
+    /// swap and the write's own word, and no such word where the worker
+    /// left no model.
+    fn rebuild_leaving(
+        &self,
+        workers: &Workers,
+        classes: Classes,
+        change: MembershipChange,
+        left: &[String],
+    ) {
+        self.swap_world(workers, classes);
+        if !left.is_empty() {
+            let id = change.id();
+            self.tell_engine(&Membership::Left { id, models: left });
         }
+        self.tell_of(change);
     }
 
     /// The swap of [`MemoryStore::rebuild_world`] alone, the load lock let
@@ -647,7 +672,22 @@ impl MemoryStore {
         let mut members: Vec<WorkerId> = workers.rows.keys().copied().collect();
         members.sort_unstable();
         let told = Membership::Snapshot(&members);
-        self.world.load().spec().engine().on_membership(&told);
+        self.tell_engine(&told);
+    }
+
+    /// The telling of [`MemoryStore::rebuild_world`] alone: what `change`
+    /// is to the engine of the world the store shows. A status change is
+    /// no membership word.
+    fn tell_of(&self, change: MembershipChange) {
+        if let Some(change) = change.as_lifecycle() {
+            self.tell_engine(&change);
+        }
+    }
+
+    /// Tell the engine of the world the store shows one membership word:
+    /// under the workers lock, with the load lock let go.
+    fn tell_engine(&self, word: &Membership<'_>) {
+        self.world.load().spec().engine().on_membership(word);
     }
 
     /// Show the deciders the world a write made, when it made one. Called
@@ -1024,7 +1064,11 @@ impl WorkersStore for MemoryStore {
                         joined: Some(old_id),
                     }
                 };
-                row.row.facts = facts;
+                // The models this registration took the worker off: the
+                // stages hear them ahead of the write's own word. The
+                // facts it replaces end here, ahead of the write's world.
+                let old = mem::replace(&mut row.row.facts, facts);
+                let left = left_models(old, &row.row.facts);
                 row.row.revision += 1;
                 let change = workers.record(if resized {
                     MembershipChange::Resized { id: old_id }
@@ -1032,7 +1076,7 @@ impl WorkersStore for MemoryStore {
                     MembershipChange::Relabelled { id: old_id }
                 });
                 self.index_member(&workers, old_id);
-                self.rebuild_world(&workers, classes, change);
+                self.rebuild_leaving(&workers, classes, change, &left);
                 return change;
             }
             // A new incarnation under the key: the old id leaves with its
